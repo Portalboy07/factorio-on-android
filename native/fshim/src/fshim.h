@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,6 +20,11 @@ void *fshim_install_tls(void);
  * main(argc, argv).  Returns the game's exit code (or 70 on setup failure).
  */
 int fshim_run(const char *game_path, int argc, char **argv);
+
+/* Load range of libfactorio_game.so, set by fshim_run() before main();
+ * crash logs print addresses relative to the base. */
+extern uintptr_t fshim_game_base;
+extern uintptr_t fshim_game_end;
 
 #ifdef __cplusplus
 }

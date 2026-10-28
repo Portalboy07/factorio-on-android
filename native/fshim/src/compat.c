@@ -13,16 +13,19 @@
 #include <errno.h>
 #include <locale.h>
 #include <langinfo.h>
+#include <link.h>
 #include <malloc.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/auxv.h>
 #include <sys/sysinfo.h>
 #include <sys/socket.h>
+#include <sys/ucontext.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +35,8 @@
 #include <wctype.h>
 
 #include <android/log.h>
+
+#include "fshim.h"
 
 #define TAG "fshim"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
@@ -54,12 +59,69 @@ int __libc_start_main(int (*main_fn)(int, char **, char **), int argc,
     _exit(main_fn(argc, argv, environ));
 }
 
-/* Returned only as an empty answer; nothing in the port needs unwinding info. */
+/* glibc 2.35 `struct dl_find_object`, aarch64 layout (no eh_dbase/eh_count). */
+struct glibc_dl_find_object {
+    unsigned long long dlfo_flags;
+    void *dlfo_map_start;
+    void *dlfo_map_end;
+    void *dlfo_link_map;
+    void *dlfo_eh_frame;
+    unsigned long long dlfo_reserved[7];
+};
+
+_Static_assert(sizeof(struct glibc_dl_find_object) == 96, "glibc dl_find_object size");
+
+struct find_object_search {
+    uintptr_t address;
+    struct glibc_dl_find_object *result;
+    int found;
+};
+
+static int find_object_callback(struct dl_phdr_info *info, size_t size, void *opaque)
+{
+    (void)size;
+    struct find_object_search *search = opaque;
+    uintptr_t low = UINTPTR_MAX, high = 0;
+    void *eh_frame = NULL;
+    int hit = 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+        uintptr_t start = (uintptr_t)info->dlpi_addr + phdr->p_vaddr;
+        if (phdr->p_type == PT_LOAD) {
+            uintptr_t end = start + phdr->p_memsz;
+            if (start < low) low = start;
+            if (end > high) high = end;
+            if (search->address >= start && search->address < end) hit = 1;
+        } else if (phdr->p_type == PT_GNU_EH_FRAME) {
+            eh_frame = (void *)start;
+        }
+    }
+    if (!hit) {
+        return 0;
+    }
+    memset(search->result, 0, sizeof(*search->result));
+    search->result->dlfo_map_start = (void *)low;
+    search->result->dlfo_map_end = (void *)high;
+    search->result->dlfo_eh_frame = eh_frame;
+    search->found = 1;
+    return 1;
+}
+
+/* The game's statically linked libgcc (GCC 12+ against glibc 2.35+) finds
+ * unwind tables only through _dl_find_object, with no dl_iterate_phdr
+ * fallback: answering "not found" turned every C++ throw into
+ * std::terminate -> abort (a failed login or a malformed mod crashed the
+ * game).  bionic has no _dl_find_object, so locate the object and its
+ * PT_GNU_EH_FRAME with dl_iterate_phdr. */
 int _dl_find_object(void *address, void *result)
 {
-    (void)address;
-    (void)result;
-    return -1;
+    struct find_object_search search = {
+        .address = (uintptr_t)address,
+        .result = (struct glibc_dl_find_object *)result,
+        .found = 0,
+    };
+    dl_iterate_phdr(find_object_callback, &search);
+    return search.found ? 0 : -1;
 }
 
 /* ------------------------------------------------------------- libc extras */
@@ -563,6 +625,174 @@ int __xpg_strerror_r(int error, char *buffer, size_t size)
 int __sigsetjmp(void *environment, int save_mask)
 {
     return sigsetjmp(*(sigjmp_buf *)environment, save_mask);
+}
+
+/* --------------------------------------------------------------- signals */
+
+/* glibc's aarch64 `struct sigaction`.  bionic's LP64 layout is
+ *   { int sa_flags; handler; sigset_t sa_mask (8 bytes); sa_restorer; }
+ * so handing the game's struct straight to bionic made it read the low half
+ * of the handler pointer as sa_flags and the signal mask as the handler.
+ * tools/port.py renames the game's `sigaction`/`signal` imports to these. */
+struct glibc_sigaction {
+    void *handler;
+    unsigned long sa_mask[16];          /* 1024-bit glibc sigset_t */
+    int sa_flags;
+    void (*sa_restorer)(void);
+};
+
+_Static_assert(offsetof(struct glibc_sigaction, sa_flags) == 136, "glibc sa_flags slot");
+_Static_assert(sizeof(struct glibc_sigaction) == 152, "glibc sigaction size");
+
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define FATAL_SIGNAL_LIMIT 32
+
+/* The game's own handler per fatal signal; it runs after the crash log. */
+static struct {
+    void *handler;
+    int flags;
+} game_fatal[FATAL_SIGNAL_LIMIT];
+
+static int is_fatal_signal(int sig)
+{
+    return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE ||
+           sig == SIGABRT || sig == SIGTRAP;
+}
+
+static void log_frame(const char *what, int index, uintptr_t pc)
+{
+    if (pc >= fshim_game_base && pc < fshim_game_end) {
+        LOGE("  %s#%02d game+0x%lx", what, index, (unsigned long)(pc - fshim_game_base));
+        return;
+    }
+    Dl_info info;
+    if (dladdr((void *)pc, &info) && info.dli_fname) {
+        const char *base = strrchr(info.dli_fname, '/');
+        LOGE("  %s#%02d %s+0x%lx %s", what, index, base ? base + 1 : info.dli_fname,
+             (unsigned long)(pc - (uintptr_t)info.dli_fbase),
+             info.dli_sname ? info.dli_sname : "");
+    } else {
+        LOGE("  %s#%02d 0x%lx", what, index, (unsigned long)pc);
+    }
+}
+
+/* Logs where the fault happened (offsets are relative to the game image, so
+ * they symbolize against the stock Linux binary), then runs the game's own
+ * handler.  The game's crash handler hangs while symbolizing on Android, so
+ * this is the only usable crash location. */
+static void fatal_signal_logger(int sig, siginfo_t *info, void *context)
+{
+    static int logged;
+    if (!__atomic_exchange_n(&logged, 1, __ATOMIC_SEQ_CST)) {
+        const mcontext_t *mc = &((const ucontext_t *)context)->uc_mcontext;
+        LOGE("fatal signal %d code %d fault addr %p tid %d", sig, info->si_code,
+             info->si_addr, gettid());
+        log_frame("pc", 0, mc->pc);
+        log_frame("lr", 0, mc->regs[30]);
+        /* Frame records: [fp] = caller's fp, [fp + 8] = return address.
+         * Stay inside this thread's stack so a bad chain cannot fault. */
+        uintptr_t lo = 0, hi = 0;
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            void *addr = NULL;
+            size_t size = 0;
+            if (pthread_attr_getstack(&attr, &addr, &size) == 0) {
+                lo = (uintptr_t)addr;
+                hi = lo + size;
+            }
+            pthread_attr_destroy(&attr);
+        }
+        uintptr_t fp = mc->regs[29];
+        for (int i = 1; i <= 32 && hi; i++) {
+            if ((fp & 7) || fp < lo || fp + 16 > hi) {
+                break;
+            }
+            const uintptr_t *record = (const uintptr_t *)fp;
+            if (!record[1]) {
+                break;
+            }
+            log_frame("fp", i, record[1]);
+            if (record[0] <= fp) {
+                break;
+            }
+            fp = record[0];
+        }
+    }
+    void *handler = game_fatal[sig].handler;
+    if (handler == (void *)SIG_IGN) {
+        return;
+    }
+    if (handler == (void *)SIG_DFL || !handler) {
+        /* Returning re-executes the fault with the default action. */
+        signal(sig, SIG_DFL);
+        return;
+    }
+    if (game_fatal[sig].flags & SA_SIGINFO) {
+        ((void (*)(int, siginfo_t *, void *))handler)(sig, info, context);
+    } else {
+        ((void (*)(int))handler)(sig);
+    }
+}
+
+int fs_sigact(int sig, const struct glibc_sigaction *act, struct glibc_sigaction *old)
+{
+    int fatal = sig > 0 && sig < FATAL_SIGNAL_LIMIT && is_fatal_signal(sig);
+    void *prev_game = fatal ? game_fatal[sig].handler : NULL;
+    int prev_game_flags = fatal ? game_fatal[sig].flags : 0;
+
+    struct sigaction native, previous;
+    memset(&native, 0, sizeof(native));
+    memset(&previous, 0, sizeof(previous));
+    if (act) {
+        native.sa_flags = act->sa_flags & ~SA_RESTORER;
+        native.sa_handler = (sighandler_t)act->handler;
+        memcpy(&native.sa_mask, act->sa_mask, sizeof(native.sa_mask));
+        if (fatal && act->handler != (void *)SIG_DFL && act->handler != (void *)SIG_IGN) {
+            game_fatal[sig].handler = act->handler;
+            game_fatal[sig].flags = act->sa_flags;
+            native.sa_sigaction = fatal_signal_logger;
+            native.sa_flags |= SA_SIGINFO;
+        }
+    }
+    if (sigaction(sig, act ? &native : NULL, &previous) != 0) {
+        if (fatal) {
+            game_fatal[sig].handler = prev_game;
+            game_fatal[sig].flags = prev_game_flags;
+        }
+        return -1;
+    }
+    if (act && fatal && native.sa_sigaction != fatal_signal_logger) {
+        game_fatal[sig].handler = act->handler;     /* SIG_DFL / SIG_IGN */
+        game_fatal[sig].flags = act->sa_flags;
+    }
+    if (old) {
+        memset(old, 0, sizeof(*old));
+        old->handler = (void *)previous.sa_handler;
+        old->sa_flags = previous.sa_flags;
+        if (fatal && previous.sa_sigaction == fatal_signal_logger) {
+            old->handler = prev_game;
+            old->sa_flags = prev_game_flags;
+        }
+        memcpy(old->sa_mask, &previous.sa_mask, sizeof(previous.sa_mask));
+    }
+    return 0;
+}
+
+/* glibc signal(): BSD semantics (SA_RESTART, the signal blocked while its
+ * handler runs).  Routed through fs_sigact for the crash log. */
+void *fs_sig(int sig, void *handler)
+{
+    struct glibc_sigaction act, old;
+    memset(&act, 0, sizeof(act));
+    act.handler = handler;
+    act.sa_flags = SA_RESTART;
+    if (sig > 0 && sig <= 64) {
+        act.sa_mask[0] = 1UL << (sig - 1);
+    }
+    if (fs_sigact(sig, &act, &old) != 0) {
+        return (void *)SIG_ERR;
+    }
+    return old.handler;
 }
 
 /* --------------------------------------------------------------- resolver */

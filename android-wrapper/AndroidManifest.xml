@@ -21,6 +21,10 @@
         android:hasCode="true"
         android:hardwareAccelerated="true">
 
+        <!-- Lets simpleperf/Perfetto attach from adb shell on non-rooted
+             devices (Android 10+); no effect on release behaviour. -->
+        <profileable android:shell="true" />
+
         <!-- Touch-to-mouse synthesis: the desktop game is mouse-driven.
              Applied by SDL itself via SDLActivity.getManifestEnvironmentVariables()
              during SDL init.  Hint names are the string values SDL looks up

@@ -18,10 +18,14 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+uintptr_t fshim_game_base;
+uintptr_t fshim_game_end;
+
 struct base_search {
     const char *path;
     const char *soname;
     uintptr_t base;
+    uintptr_t end;
 };
 
 static int find_base(struct dl_phdr_info *info, size_t size, void *opaque)
@@ -32,6 +36,13 @@ static int find_base(struct dl_phdr_info *info, size_t size, void *opaque)
     if ((search->path && strcmp(name, search->path) == 0) ||
         (search->soname && strstr(name, search->soname))) {
         search->base = (uintptr_t)info->dlpi_addr;
+        for (int i = 0; i < info->dlpi_phnum; i++) {
+            const ElfW(Phdr) *phdr = &info->dlpi_phdr[i];
+            uintptr_t end = search->base + phdr->p_vaddr + phdr->p_memsz;
+            if (phdr->p_type == PT_LOAD && end > search->end) {
+                search->end = end;
+            }
+        }
         return 1;
     }
     return 0;
@@ -108,12 +119,16 @@ int fshim_run(const char *game_path, int argc, char **argv)
 
     struct base_search search = { .path = game_path,
                                   .soname = "libfactorio_game.so",
-                                  .base = 0 };
+                                  .base = 0,
+                                  .end = 0 };
     dl_iterate_phdr(find_base, &search);
     if (!search.base) {
         LOGE("cannot find the load base of %s", game_path);
         return 70;
     }
+
+    fshim_game_base = search.base;
+    fshim_game_end = search.end;
 
     int (*game_main)(int, char **) =
         (int (*)(int, char **))(search.base + FACTORIO_MAIN_VADDR);

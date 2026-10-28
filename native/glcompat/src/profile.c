@@ -82,7 +82,23 @@ FsglProf fsgl_prof_table[FSGL_P_COUNT] = {
     [FSGL_P_glSamplerParameterf] = { "glSamplerParameterf", 0, 0, 0, 0, 0, false },
     [FSGL_P_glSamplerParameterfv] = { "glSamplerParameterfv", 0, 0, 0, 0, 0, false },
     [FSGL_P_glSamplerParameteriv] = { "glSamplerParameteriv", 0, 0, 0, 0, 0, false },
+
+    [FSGL_P_glClientWaitSync] = { "glClientWaitSync", 0, 0, 0, 0, 0, false },
+    [FSGL_P_glWaitSync] = { "glWaitSync", 0, 0, 0, 0, 0, false },
+    [FSGL_P_glFinish] = { "glFinish", 0, 0, 0, 0, 0, false },
+    [FSGL_P_glFlush] = { "glFlush", 0, 0, 0, 0, 0, false },
+    [FSGL_P_glReadPixels] = { "glReadPixels", 0, 0, 0, 0, 0, true },
+    [FSGL_P_glBufferSubData] = { "glBufferSubData", 0, 0, 0, 0, 0, true },
 };
+
+static void prof_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void prof_log(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fsgl_vlog(ANDROID_LOG_INFO, PROF_TAG, fmt, ap);
+    va_end(ap);
+}
 
 uint64_t fsgl_now_ns(void)
 {
@@ -113,7 +129,7 @@ static void prof_dump(void)
         return;
     }
 
-    /* Insertion sort by descending total time; n is ~44. */
+    /* Insertion sort by descending total time; n is ~60. */
     for (int i = 1; i < n; i++) {
         int v = order[i];
         int j = i - 1;
@@ -127,14 +143,14 @@ static void prof_dump(void)
     for (int i = 0; i < n; i++) {
         const FsglProf *p = &snap[order[i]];
         if (p->has_bytes) {
-            __android_log_print(ANDROID_LOG_INFO, PROF_TAG,
+            prof_log(
                                 "%s calls=%llu total=%.1fms max=%.1fms bytes_in=%llu bytes_out=%llu",
                                 p->name, (unsigned long long)p->calls,
                                 (double)p->total_ns / 1e6, (double)p->max_ns / 1e6,
                                 (unsigned long long)p->bytes_in,
                                 (unsigned long long)p->bytes_out);
         } else {
-            __android_log_print(ANDROID_LOG_INFO, PROF_TAG,
+            prof_log(
                                 "%s calls=%llu total=%.1fms max=%.1fms",
                                 p->name, (unsigned long long)p->calls,
                                 (double)p->total_ns / 1e6, (double)p->max_ns / 1e6);
@@ -167,7 +183,7 @@ static void prof_init(void)
     if (pthread_attr_init(&attr) == 0) {
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&th, &attr, prof_thread, NULL) != 0) {
-            __android_log_print(ANDROID_LOG_WARN, PROF_TAG,
+            prof_log(
                                 "profiler: periodic dump thread unavailable; only the final dump will run");
         }
         pthread_attr_destroy(&attr);
@@ -179,8 +195,12 @@ void fsgl_prof_start(void)
     pthread_once(&g_prof_once, prof_init);
 }
 
+/* Release builds start the dump thread only when the stream trace is
+ * enabled from glcompat.ini (stream.c calls fsgl_prof_start()). */
+#if FSGL_DIAG
 __attribute__((constructor)) static void prof_ctor(void)
 {
     fsgl_prof_start();
     atexit(prof_dump);
 }
+#endif

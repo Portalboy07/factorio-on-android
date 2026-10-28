@@ -31,9 +31,10 @@ import struct
 import sys
 from pathlib import Path
 
-from elf import (DT_DEBUG, DT_FLAGS_1, DT_NEEDED, DT_NULL, DF_1_PIE,
+from elf import (DT_DEBUG, DT_FLAGS_1, DT_NEEDED, DT_NULL, DF_1_PIE, DT_SONAME,
                  DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
-                 ELF, ELFError, PT_INTERP, PT_LOAD, PT_NULL, PT_TLS, SHT_NOBITS)
+                 ELF, ELFError, PT_INTERP, PT_LOAD, PT_NULL, PT_TLS, SHT_DYNSYM,
+                 SHT_NOBITS)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = ROOT / "build/libfactorio_game.so"
@@ -45,6 +46,16 @@ NEEDED_MAP = {
     "libc.so.6": "libc.so",
     "libm.so.6": "libm.so",
     "libresolv.so.2": "libfshim.so",
+}
+
+# Imports whose glibc ABI differs from bionic's.  The game's references are
+# renamed in place (same length) to libfshim.so wrappers that translate the
+# structures.  Defining the original names in the shim would not work:
+# app_process exports ART's sigchain sigaction/signal globally, and the
+# global group wins over the game's own DT_NEEDED libraries.
+IMPORT_RENAMES = {
+    "sigaction": "fs_sigact",   # glibc struct sigaction: 152 bytes, handler first
+    "signal": "fs_sig",         # same ABI; wrapped to log fatal-signal crashes
 }
 
 EXPECTED_SDL = (3, 4, 14)  # SDL version used by this Android wrapper build
@@ -133,6 +144,41 @@ def rewrite_dynamic(elf: ELF, *, drop_versions: bool = True) -> dict:
     return {"dropped_tags": dropped, "needed_renamed": renamed,
             "pie_flag_cleared": pie_cleared, "versym_entries_neutralised": zeroed,
             "dynamic_entries": len(kept) - 1}
+
+
+def rename_imports(elf: ELF) -> dict:
+    """Point selected undefined dynamic symbols at fshim wrappers."""
+    tables = elf.sections(SHT_DYNSYM)
+    if len(tables) != 1:
+        raise ELFError("expected exactly one .dynsym")
+    table = tables[0]
+    strtab = elf.shdrs[table["link"]]["offset"]
+    entries = []
+    for i in range(table["size"] // 24):
+        name, _info, _other, shndx, _value, _size = struct.unpack_from(
+            "<IBBHQQ", elf.data, table["offset"] + i * 24)
+        entries.append((name, shndx))
+    referenced = {name for name, _ in entries if name}
+    referenced |= {e["value"] for e in elf.dynamic() if e["tag"] in (DT_NEEDED, DT_SONAME)}
+    renamed = []
+    for name_off, shndx in entries:
+        if not name_off or shndx != 0:
+            continue
+        name = cstring(elf.data, strtab + name_off)
+        new = IMPORT_RENAMES.get(name)
+        if new is None:
+            continue
+        if len(new) != len(name):
+            raise ELFError(f"import rename {name} -> {new} must keep the length")
+        # The string must be its own: not the merged tail of a longer name,
+        # and with no other reference pointing into it.
+        if elf.data[strtab + name_off - 1] != 0 or any(
+                name_off < other <= name_off + len(name) for other in referenced):
+            raise ELFError(f"import {name} shares .dynstr storage; cannot rename in place")
+        elf.put_bytes(strtab + name_off, new.encode())
+        renamed.append({"from": name, "to": new})
+    done = {r["from"] for r in renamed}
+    return {"renamed": renamed, "not_imported": sorted(set(IMPORT_RENAMES) - done)}
 
 
 def extend_bss(elf: ELF, extra: int) -> int:
@@ -696,6 +742,9 @@ def main(argv: list[str] | None = None) -> int:
         report["sdl"]["records"] = redirects["records"]
         print(f"  SDL redirects: {redirects['count']} "
               f"(skipped {len(redirects['skipped'])}), slots at {hex(slot_base)}")
+    report["imports"] = rename_imports(elf)
+    print("  imports renamed: " + (", ".join(
+        f"{r['from']}->{r['to']}" for r in report["imports"]["renamed"]) or "none"))
     report["dynamic"] = rewrite_dynamic(elf)
     print(f"  dynamic: dropped {len(report['dynamic']['dropped_tags'])}, "
           f"renamed {len(report['dynamic']['needed_renamed'])}")

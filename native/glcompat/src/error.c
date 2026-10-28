@@ -39,7 +39,7 @@ void fsgl_err_log(int prio, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    __android_log_vprint(prio, ERR_TAG, fmt, ap);
+    fsgl_vlog(prio, ERR_TAG, fmt, ap);
     va_end(ap);
 }
 
@@ -62,6 +62,7 @@ typedef struct {
 static RingEntry t_ring[RING_LEN];
 static unsigned t_ring_pos;
 
+#if FSGL_DIAG
 void fsgl_ring_push(const char *name, uintptr_t a0, uintptr_t a1,
                     uintptr_t a2, uintptr_t a3)
 {
@@ -73,6 +74,7 @@ void fsgl_ring_push(const char *name, uintptr_t a0, uintptr_t a1,
     e->a[3] = a3;
     __atomic_store_n(&e->name, name, __ATOMIC_RELEASE);
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Virtual error queue (single GL thread; see the ring comment above)  */
@@ -180,6 +182,7 @@ static bool err_rate_allow(const char *name, GLenum err, uint64_t now)
     return true;
 }
 
+#if FSGL_DIAG
 void fsgl_err_check(const char *name, const char *params_fmt, ...)
 {
     PFN_glGetError geterr = real_get_error();
@@ -204,6 +207,7 @@ void fsgl_err_check(const char *name, const char *params_fmt, ...)
     fsgl_err_log(ANDROID_LOG_WARN, "%s (0x%x) after %s(%s)",
                  err_name(err), (unsigned)err, name, params);
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Layer-internal call bracketing                                      */
@@ -220,14 +224,19 @@ static void drain_internal(const char *name, bool preserve)
         if (err == GL_NO_ERROR) {
             return;
         }
+        /* Every line is a syscall into logd; an error that recurs each draw
+         * must not turn into a log storm on the render thread. */
+        bool log = err_rate_allow(name, err, fsgl_now_ns());
         if (preserve) {
             /* An error from an earlier caller call, not from us: keep it
              * visible to the caller's next glGetError. */
             q_push(err);
-            fsgl_err_log(ANDROID_LOG_DEBUG,
-                         "pre-existing %s (0x%x) before %s; preserved for caller",
-                         err_name(err), (unsigned)err, name);
-        } else {
+            if (log) {
+                fsgl_err_log(ANDROID_LOG_DEBUG,
+                             "pre-existing %s (0x%x) before %s; preserved for caller",
+                             err_name(err), (unsigned)err, name);
+            }
+        } else if (log) {
             fsgl_err_log(ANDROID_LOG_DEBUG,
                          "internal %s (0x%x) from %s's layer-internal GL calls; drained",
                          err_name(err), (unsigned)err, name);
@@ -292,6 +301,7 @@ static void log_ring(GLenum err, uintptr_t site)
                              "glGetError=%s (0x%x) at caller 0x%llx; last intercepted calls (newest first):",
                              err_name(err), (unsigned)err, (unsigned long long)site);
     unsigned pos = __atomic_load_n(&t_ring_pos, __ATOMIC_ACQUIRE);
+    /* Release builds never fill the ring; the loop then ends at once. */
     for (int i = 0; i < RING_LEN && used < sizeof(buf) - 64; i++) {
         unsigned idx = (pos - 1 - (unsigned)i) & (RING_LEN - 1);
         const RingEntry *e = &t_ring[idx];

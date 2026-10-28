@@ -66,6 +66,22 @@ The APKs are written to build/output/apk/:
   - factorio-{version}-panfrost-experimental.apk
   - factorio-{version}-glcompat-unverisal.apk
 
+## GLCompat diagnostics build
+
+By default GLCompat is built without instrumentation. For profiling, build with:
+
+```sh
+GLCOMPAT_DIAG=ON ./build.sh
+```
+
+This brings back the per-wrapper profiler (`adb logcat -s glcompat-perf`, a dump every 10 s), GL error
+attribution (`glcompat-err`), the stream report (`glcompat-stream`), and timing probes on
+`glClientWaitSync`/`glWaitSync`/`glFinish`/`glFlush`/`glReadPixels`/`glBufferSubData`, where CPU↔GPU
+synchronisation usually hides.
+
+Runtime knobs live in `/storage/emulated/0/Android/data/org.factorio.android/files/glcompat.ini`
+(`key=value`, no reinstall needed): `trace`, `fence`, `early_unmap`, `safe`, `invalidate_range`, `verbose`.
+
 
 # Installing
 

@@ -11,12 +11,15 @@ import android.view.WindowManager;
 
 import org.libsdl.app.SDLActivity;
 
+import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 
 /**
  * Factorio on Android.
@@ -136,10 +139,30 @@ public class FactorioActivity extends SDLActivity {
         // The game resolves its install dir from /proc/self/exe, so every
         // path has to be absolute.  The shim already runs under this layout
         // in the shell harness.
-        return new String[] {
-            "--config", base + "/config.ini",
-            "--mod-directory", base + "/mods",
-        };
+        ArrayList<String> args = new ArrayList<>();
+        args.add("--config");
+        args.add(base + "/config.ini");
+        args.add("--mod-directory");
+        args.add(base + "/mods");
+        // Optional extra arguments for testing, one per line, e.g.
+        // "--benchmark-graphics" / "<path to save>"; delete the file to go
+        // back to a normal start.
+        File extra = new File(ext, "args.txt");
+        if (extra.isFile()) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(extra))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (!line.isEmpty()) {
+                        args.add(line);
+                    }
+                }
+                Log.i(TAG, "extra arguments from " + extra + ": " + args.subList(4, args.size()));
+            } catch (IOException e) {
+                Log.e(TAG, "cannot read " + extra, e);
+            }
+        }
+        return args.toArray(new String[0]);
     }
 
     @Override

@@ -98,15 +98,48 @@
 
 #define TAG "glcompat"
 
+#if FSGL_DIAG
+static FILE *g_logfile;
+static pthread_once_t g_logfile_once = PTHREAD_ONCE_INIT;
+
+static void logfile_open(void)
+{
+    const char *path = getenv("FSGL_LOG_FILE");
+    if (!path || !*path) {
+        path = "/storage/emulated/0/Android/data/org.factorio.android/files/glcompat.log";
+    }
+    g_logfile = fopen(path, "w");
+    if (g_logfile) {
+        setvbuf(g_logfile, NULL, _IOLBF, 0);
+    }
+}
+#endif
+
+void fsgl_vlog(int prio, const char *tag, const char *fmt, va_list ap)
+{
+#if FSGL_DIAG
+    va_list copy;
+    va_copy(copy, ap);
+    pthread_once(&g_logfile_once, logfile_open);
+    if (g_logfile) {
+        fprintf(g_logfile, "%.3f %s: ", (double)fsgl_now_ns() / 1e9, tag);
+        vfprintf(g_logfile, fmt, copy);
+        fputc('\n', g_logfile);
+    }
+    va_end(copy);
+#endif
+    __android_log_vprint(prio, tag, fmt, ap);
+}
+
 void fsgl_log(int prio, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    __android_log_vprint(prio, TAG, fmt, ap);
+    fsgl_vlog(prio, TAG, fmt, ap);
     va_end(ap);
 }
 
-void fsgl_log_once(const char *key, const char *fmt, ...)
+void fsgl_log_once_impl(const char *key, const char *fmt, ...)
 {
     static const char *seen[256];
     static int nseen = 0;
@@ -120,7 +153,7 @@ void fsgl_log_once(const char *key, const char *fmt, ...)
     }
     va_list ap;
     va_start(ap, fmt);
-    __android_log_vprint(ANDROID_LOG_INFO, TAG, fmt, ap);
+    fsgl_vlog(ANDROID_LOG_INFO, TAG, fmt, ap);
     va_end(ap);
 }
 
@@ -256,6 +289,23 @@ static const char *const k_real_names[FSGL_R_COUNT] = {
     [FSGL_R_glGetQueryObjecti64vEXT] = "glGetQueryObjecti64vEXT",
     [FSGL_R_glGetQueryObjectui64vEXT] = "glGetQueryObjectui64vEXT",
     [FSGL_R_glGetQueryObjectivEXT] = "glGetQueryObjectivEXT",
+
+    [FSGL_R_glGenerateMipmap] = "glGenerateMipmap",
+    [FSGL_R_glGenTextures] = "glGenTextures",
+
+    [FSGL_R_glWaitSync] = "glWaitSync",
+    [FSGL_R_glFinish] = "glFinish",
+    [FSGL_R_glFlush] = "glFlush",
+
+    [FSGL_R_glClear] = "glClear",
+    [FSGL_R_glClearBufferfv] = "glClearBufferfv",
+    [FSGL_R_glClearBufferfi] = "glClearBufferfi",
+    [FSGL_R_glInvalidateFramebuffer] = "glInvalidateFramebuffer",
+    [FSGL_R_glBlitFramebuffer] = "glBlitFramebuffer",
+    [FSGL_R_glDrawElementsInstanced] = "glDrawElementsInstanced",
+    [FSGL_R_glDrawElementsBaseVertex] = "glDrawElementsBaseVertex",
+    [FSGL_R_glDrawRangeElements] = "glDrawRangeElements",
+    [FSGL_R_glAttachShader] = "glAttachShader",
 };
 
 FSGLProc fsgl_real_slow(FsglRealId id)
@@ -313,8 +363,8 @@ static void ext_add_synthetic(const char *name, const char *probe_a, const char 
 {
     if (fsgl_have(probe_a) || (probe_b && fsgl_have(probe_b))) {
         ext_add(name);
-        fsgl_log_once(name, "extension: advertising synthetic %s (backed by %s%s%s)",
-                      name, probe_a, probe_b ? "/" : "", probe_b ? probe_b : "");
+        fsgl_log_once_impl(name, "extension: advertising synthetic %s (backed by %s%s%s)",
+                           name, probe_a, probe_b ? "/" : "", probe_b ? probe_b : "");
     }
 }
 
@@ -355,7 +405,22 @@ static void ext_build(void)
         }
     }
 
+    /* What the driver itself can decode; the upload path transcodes the
+     * rest.  Resolved before synthetic entries join the list. */
+    g_ext_caps.s3tc = ext_list_contains("GL_EXT_texture_compression_s3tc") ||
+                      ext_list_contains("GL_ARB_texture_compression_s3tc");
+    g_ext_caps.rgtc = ext_list_contains("GL_EXT_texture_compression_rgtc") ||
+                      ext_list_contains("GL_ARB_texture_compression_rgtc");
+
     /* Only advertise synthetic desktop extensions we can actually back. */
+    if (fsgl_config_fake_s3tc()) {
+        /* Without S3TC the game uploads its colour atlases as RGBA8
+         * ("not-compressed"); advertised, it compresses them to DXT and the
+         * upload path transcodes to ETC2 (4-8 bpp instead of 32). */
+        ext_add("GL_EXT_texture_compression_s3tc");
+        ext_add("GL_ARB_texture_compression_rgtc");
+        fsgl_log_once("fake-s3tc", "extension: advertising S3TC/RGTC backed by the ETC2 transcoder");
+    }
     ext_add_synthetic("GL_ARB_copy_image", "glCopyImageSubData", NULL);
     ext_add_synthetic("GL_ARB_clear_texture", "glClearTexImage", "glClearTexSubImage");
     ext_add_synthetic("GL_KHR_debug", "glDebugMessageCallback", "glDebugMessageCallbackKHR");
@@ -393,10 +458,6 @@ static void ext_build(void)
         }
     }
     g_ext_ready = true;
-    g_ext_caps.s3tc = ext_list_contains("GL_EXT_texture_compression_s3tc") ||
-                      ext_list_contains("GL_ARB_texture_compression_s3tc");
-    g_ext_caps.rgtc = ext_list_contains("GL_EXT_texture_compression_rgtc") ||
-                      ext_list_contains("GL_ARB_texture_compression_rgtc");
     fsgl_log(ANDROID_LOG_INFO, "extensions: %u entries (real+synthetic), %zu bytes",
              g_ext_count, g_ext_joined ? strlen(g_ext_joined) : (size_t)0);
 }
@@ -595,23 +656,27 @@ FsglTexLevel *fsgl_tex_level(FsglTexRec *rec, GLint level)
 
 #define BUF_TARGETS 12
 
-static const GLenum k_buf_targets[BUF_TARGETS] = {
-    GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_PIXEL_PACK_BUFFER,
-    GL_PIXEL_UNPACK_BUFFER, GL_UNIFORM_BUFFER, GL_COPY_READ_BUFFER,
-    GL_COPY_WRITE_BUFFER, GL_TRANSFORM_FEEDBACK_BUFFER, GL_SHADER_STORAGE_BUFFER,
-    GL_DRAW_INDIRECT_BUFFER, GL_DISPATCH_INDIRECT_BUFFER, GL_ATOMIC_COUNTER_BUFFER
-};
-
 static GLuint g_buf_bound[BUF_TARGETS];
 
+/* Hit on every bind/map/draw; a switch compiles to a compare tree instead of
+ * a 12-entry linear scan. */
 static int buf_target_slot(GLenum target)
 {
-    for (int i = 0; i < BUF_TARGETS; i++) {
-        if (k_buf_targets[i] == target) {
-            return i;
-        }
+    switch (target) {
+    case GL_ARRAY_BUFFER: return 0;
+    case GL_ELEMENT_ARRAY_BUFFER: return 1;
+    case GL_PIXEL_PACK_BUFFER: return 2;
+    case GL_PIXEL_UNPACK_BUFFER: return 3;
+    case GL_UNIFORM_BUFFER: return 4;
+    case GL_COPY_READ_BUFFER: return 5;
+    case GL_COPY_WRITE_BUFFER: return 6;
+    case GL_TRANSFORM_FEEDBACK_BUFFER: return 7;
+    case GL_SHADER_STORAGE_BUFFER: return 8;
+    case GL_DRAW_INDIRECT_BUFFER: return 9;
+    case GL_DISPATCH_INDIRECT_BUFFER: return 10;
+    case GL_ATOMIC_COUNTER_BUFFER: return 11;
+    default: return -1;
     }
-    return -1;
 }
 
 GLuint fsgl_buf_bound(GLenum target)

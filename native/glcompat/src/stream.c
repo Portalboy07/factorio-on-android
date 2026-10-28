@@ -36,9 +36,14 @@
  *     entirely for the pattern above.
  *
  * Everything is env-gated so the behaviour can be bisected on device:
- *   FACTORIO_GL_TRACE=0   silence the periodic report (on by default here)
+ *   FACTORIO_GL_TRACE=1   periodic report + event ring (default: FSGL_DIAG)
  *   FACTORIO_GL_FENCE=1   create/poll unmap fences (diagnostic)
  *   FACTORIO_GL_EARLY_UNMAP=1  finish fully-flushed maps before a draw
+ *
+ * glcompat.ini accepts the same knobs plus "safe" (strip UNSYNCHRONIZED),
+ * "invalidate_range" (add MAP_INVALIDATE_RANGE to WRITE|UNSYNCHRONIZED maps,
+ * default 1) and "verbose".  invalidate_range=0 is the A/B switch for drivers
+ * that implement INVALIDATE_RANGE with a per-map staging copy.
  *
  * The module never issues GL calls unless explicitly enabled, so an
  * instrumentation-only build is a passthrough.
@@ -78,10 +83,13 @@
 #define TRACE_RING 1024
 #define MAX_ATTRIBS_REPORTED 8
 
-/* Production defaults; glcompat.ini can override these at runtime. */
-#define STREAM_DEFAULT_TRACE 1
+/* Production defaults; glcompat.ini can override these at runtime.  The
+ * trace costs a ring store per bind/attrib/map and a periodic report, so it
+ * follows the diagnostics build switch. */
+#define STREAM_DEFAULT_TRACE FSGL_DIAG
 #define STREAM_DEFAULT_FENCE 0
 #define STREAM_DEFAULT_EARLY_UNMAP 1
+#define STREAM_DEFAULT_INVALIDATE_RANGE 1
 
 typedef struct {
     bool used;
@@ -149,7 +157,10 @@ static struct {
     int early_unmap;
     int early_unmap_set;
     int safe;          /* strip UNSYNCHRONIZED: correctness control group */
+    int inval_range;   /* add INVALIDATE_RANGE to WRITE|UNSYNCHRONIZED maps */
     int verbose;
+    int fake_s3tc;     /* advertise S3TC/RGTC backed by the ETC2 transcoder */
+    int invalidate_ds; /* drop depth/stencil when leaving a framebuffer */
 
     OpenMap maps[MAX_OPEN];
     int nmaps;
@@ -196,8 +207,14 @@ static void config_apply(const char *key, const char *val)
         S.early_unmap_set = 1;
     } else if (!strcmp(key, "safe")) {
         S.safe = v;
+    } else if (!strcmp(key, "invalidate_range")) {
+        S.inval_range = v;
     } else if (!strcmp(key, "verbose")) {
         S.verbose = v;
+    } else if (!strcmp(key, "fake_s3tc")) {
+        S.fake_s3tc = v;
+    } else if (!strcmp(key, "invalidate_ds")) {
+        S.invalidate_ds = v;
     }
 }
 
@@ -265,9 +282,17 @@ static void stream_init(void)
          * safely consume that lifetime. */
         S.early_unmap = STREAM_DEFAULT_EARLY_UNMAP;
     }
+    S.inval_range = STREAM_DEFAULT_INVALIDATE_RANGE;
     stream_read_config();
-    fsgl_log(ANDROID_LOG_INFO, "stream: trace=%d fence=%d early_unmap=%d safe=%d verbose=%d",
-             S.trace, S.fence, S.early_unmap, S.safe, S.verbose);
+    fsgl_log(ANDROID_LOG_INFO,
+             "stream: trace=%d fence=%d early_unmap=%d safe=%d invalidate_range=%d verbose=%d "
+             "fake_s3tc=%d invalidate_ds=%d",
+             S.trace, S.fence, S.early_unmap, S.safe, S.inval_range, S.verbose, S.fake_s3tc,
+             S.invalidate_ds);
+    if (S.trace) {
+        /* The periodic report runs on the profiler's dump thread. */
+        fsgl_prof_start();
+    }
 }
 
 static TraceRec *trace_push(char kind, GLenum target, GLuint buf, GLintptr off,
@@ -506,11 +531,33 @@ static void fence_wait_region(GLuint buf, GLintptr off, GLsizeiptr len)
 /* Map / flush / unmap                                                 */
 /* ------------------------------------------------------------------ */
 
+bool fsgl_config_invalidate_ds(void)
+{
+    stream_init();
+    return S.invalidate_ds != 0;
+}
+
+bool fsgl_config_fake_s3tc(void)
+{
+    stream_init();
+    return S.fake_s3tc != 0;
+}
+
 GLbitfield fsgl_stream_adjust_access(GLbitfield access)
 {
     stream_init();
     if (S.safe) {
         access &= ~(GLbitfield)GL_MAP_UNSYNCHRONIZED_BIT;
+    }
+    /* The game writes the mapped range without reading its previous bytes.
+     * This is legal with WRITE and lets Adreno select a fresh backing range
+     * instead of preserving old contents, without the full-buffer stall
+     * caused by removing UNSYNCHRONIZED.  A driver that instead services
+     * INVALIDATE_RANGE through a staging copy pays for the whole mapped
+     * length on every map, hence the knob. */
+    if (S.inval_range && (access & GL_MAP_WRITE_BIT) &&
+        (access & GL_MAP_UNSYNCHRONIZED_BIT)) {
+        access |= GL_MAP_INVALIDATE_RANGE_BIT;
     }
     return access;
 }
@@ -554,7 +601,7 @@ int fsgl_stream_begin_map(GLenum target, GLuint buf, GLintptr offset,
         S.c_inval_buf++;
     }
 
-    BufStat *st = stat_get(buf, true);
+    BufStat *st = (S.trace || S.fence) ? stat_get(buf, true) : NULL;
     if (st) {
         st->maps++;
         st->bytes += (uint64_t)(length > 0 ? length : 0);
@@ -741,7 +788,8 @@ void fsgl_stream_drop_buffer(GLuint buf)
             }
         }
     }
-    for (int i = 0; i < FENCE_RING; i++) {
+    /* Fences only exist with fence=1; skip the 8192-entry scan otherwise. */
+    for (int i = 0; S.fence && i < FENCE_RING; i++) {
         if (S.fences[i].used && S.fences[i].buf == buf) {
             S.fences[i].used = false;
         }
@@ -920,6 +968,13 @@ void fsgl_stream_note_draw(const char *kind, GLuint ebo, GLsizei count,
     /* Finish only buffers this draw can dereference.  Other concurrently
      * open maps may still be receiving CPU writes for a later draw. */
     stream_finish_for_draw(ebo, vao);
+    if (!S.trace) {
+        /* Everything below only feeds the periodic report.  After the first
+         * draw of a batch the maps stay "open" (finished, awaiting the
+         * game's glUnmapBuffer), so this used to run a 16x32 slot scan on
+         * every following draw. */
+        return;
+    }
     bool ebo_hit = false;
     for (int i = 0; i < MAX_OPEN; i++) {
         OpenMap *m = &S.maps[i];
